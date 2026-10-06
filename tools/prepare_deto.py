@@ -14,7 +14,7 @@ if not manifest.exists():
 
 text = build.read_text(encoding="utf-8")
 text, n = re.subn(
-    r'(applicationId\\s*=\\s*)"[^"]+"',
+    r'(applicationId\s*=\s*)"[^"]+"',
     r'\1"ae.deto.xmicinject"',
     text,
     count=1,
@@ -25,13 +25,18 @@ if n != 1:
 build.write_text(text, encoding="utf-8")
 
 m = manifest.read_text(encoding="utf-8")
-match = re.search(r"<application\\b[^>]*>", m, re.S)
+match = re.search(r"<application\b[^>]*>", m, re.S)
 if not match:
     raise SystemExit("Could not find <application>")
 
 tag = match.group(0)
 if "android:label=" in tag:
-    tag = re.sub(r'android:label\\s*=\\s*"[^"]*"', 'android:label="Deto"', tag, count=1)
+    tag = re.sub(
+        r'android:label\s*=\s*"[^"]*"',
+        'android:label="Deto"',
+        tag,
+        count=1,
+    )
 else:
     tag = tag[:-1] + '\n        android:label="Deto">'
 
