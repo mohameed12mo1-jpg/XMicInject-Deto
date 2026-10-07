@@ -7,18 +7,16 @@ import android.util.Log
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
-import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.ceil
 
 class XMicHook : IXposedHookLoadPackage {
 
     private companion object {
         private const val TAG = "XMicHook"
         private const val DETO = "ae.deto.app"
-        private const val MODULE_PACKAGE = "ae.deto.xmicinject"
-        private val SKIP_PACKAGES = setOf("android", "com.xmicinject", MODULE_PACKAGE)
         private val MIC_SOURCES = setOf(
             MediaRecorder.AudioSource.MIC,
             MediaRecorder.AudioSource.VOICE_COMMUNICATION,
@@ -29,257 +27,384 @@ class XMicHook : IXposedHookLoadPackage {
     }
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
-        val uid = lpparam.appInfo?.uid ?: Process.INVALID_UID
         if (lpparam.packageName != DETO) return
-        if (lpparam.packageName in SKIP_PACKAGES) return
+
+        val uid = lpparam.appInfo?.uid ?: Process.INVALID_UID
         if (uid in 0 until Process.FIRST_APPLICATION_UID) return
 
-        Log.i(TAG, "Deto hook loaded")
-
+        Log.i(TAG, "Deto native hook loaded: " + DETO)
         IpcClient.startOnce()
 
         val injectionLogged = AtomicBoolean(false)
         val muteLogged = AtomicBoolean(false)
 
-        hookByteArray(lpparam.classLoader, injectionLogged, muteLogged)
-        hookShortArray(lpparam.classLoader, injectionLogged, muteLogged)
-        hookByteBuffer(lpparam.classLoader, injectionLogged, muteLogged)
+        hookNative("native_read_in_byte_array", injectionLogged, muteLogged)
+        hookNative("native_read_in_short_array", injectionLogged, muteLogged)
+        hookNative("native_read_in_float_array", injectionLogged, muteLogged)
+        hookNative("native_read_in_direct_buffer", injectionLogged, muteLogged)
     }
 
-    private fun hookByteArray(
-        cl: ClassLoader,
+    private fun hookNative(
+        methodName: String,
         injectionLogged: AtomicBoolean,
         muteLogged: AtomicBoolean
     ) {
-        val hook = object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                val count = param.result as? Int ?: return
-                if (count <= 0) return
+        runCatching {
+            val hooks = XposedBridge.hookAllMethods(
+                AudioRecord::class.java,
+                methodName,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val record = param.thisObject as? AudioRecord ?: return
+                        val hz = sampleRate(record)
+                        val channels = channelCount(record)
 
-                val buf = param.args[0] as? ByteArray ?: return
-                val off = param.args[1] as? Int ?: return
-                val record = param.thisObject as? AudioRecord ?: return
-                val hz = sampleRate(record)
+                        when (methodName) {
+                            "native_read_in_byte_array" -> {
+                                val resultBytes = param.result as? Int ?: return
+                                if (resultBytes <= 0) return
 
-                val replaced = if (isMicSource(record)) {
-                    UplinkSender.send(buf, off, count, hz, channelCount(record), streamId(record))
-                    injectBytes(buf, off, count, hz)
-                } else {
-                    injectBytes(buf, off, count, hz)
-                }
+                                val dst = param.args.getOrNull(0) as? ByteArray ?: return
+                                val off = param.args.getOrNull(1) as? Int ?: return
+                                if (off < 0 || off >= dst.size) return
 
-                if (replaced) {
-                    if (injectionLogged.compareAndSet(false, true)) {
-                        Log.i(TAG, "Injection active: byte[]")
+                                val safeCount = minOf(resultBytes, dst.size - off)
+
+                                if (isMicSource(record)) {
+                                    UplinkSender.send(
+                                        dst, off, safeCount, hz,
+                                        channels, streamId(record)
+                                    )
+                                }
+
+                                val replaced = injectPcm16Bytes(
+                                    dst, off, safeCount, hz, channels
+                                )
+
+                                finishResult(
+                                    replaced, methodName,
+                                    injectionLogged, muteLogged
+                                ) {
+                                    val end = minOf(dst.size, off + safeCount)
+                                    if (end > off) dst.fill(0, off, end)
+                                }
+                            }
+
+                            "native_read_in_short_array" -> {
+                                val resultSamples = param.result as? Int ?: return
+                                if (resultSamples <= 0) return
+
+                                val dst = param.args.getOrNull(0) as? ShortArray ?: return
+                                val off = param.args.getOrNull(1) as? Int ?: return
+                                if (off < 0 || off >= dst.size) return
+
+                                val safeCount = minOf(resultSamples, dst.size - off)
+
+                                if (isMicSource(record)) {
+                                    val end = off + safeCount
+                                    val bytes = AudioResampler.shortsToBytes(
+                                        dst.copyOfRange(off, end)
+                                    )
+                                    UplinkSender.send(
+                                        bytes, 0, bytes.size, hz,
+                                        channels, streamId(record)
+                                    )
+                                }
+
+                                val replaced = injectPcm16Shorts(
+                                    dst, off, safeCount, hz, channels
+                                )
+
+                                finishResult(
+                                    replaced, methodName,
+                                    injectionLogged, muteLogged
+                                ) {
+                                    val end = minOf(dst.size, off + safeCount)
+                                    if (end > off) dst.fill(0, off, end)
+                                }
+                            }
+
+                            "native_read_in_float_array" -> {
+                                val resultSamples = param.result as? Int ?: return
+                                if (resultSamples <= 0) return
+
+                                val dst = param.args.getOrNull(0) as? FloatArray ?: return
+                                val off = param.args.getOrNull(1) as? Int ?: return
+                                if (off < 0 || off >= dst.size) return
+
+                                val safeCount = minOf(resultSamples, dst.size - off)
+
+                                val replaced = injectFloatSamples(
+                                    dst, off, safeCount, hz, channels
+                                )
+
+                                finishResult(
+                                    replaced, methodName,
+                                    injectionLogged, muteLogged
+                                ) {
+                                    val end = minOf(dst.size, off + safeCount)
+                                    if (end > off) dst.fill(0f, off, end)
+                                }
+                            }
+
+                            "native_read_in_direct_buffer" -> {
+                                val resultBytes = param.result as? Int ?: return
+                                if (resultBytes <= 0) return
+
+                                val buffer =
+                                    param.args.getOrNull(0) as? ByteBuffer ?: return
+
+                                val start = buffer.position().coerceAtLeast(0)
+                                val safeCount = minOf(
+                                    resultBytes,
+                                    buffer.capacity() - start
+                                )
+                                if (safeCount <= 0) return
+
+                                val original = ByteArray(safeCount)
+                                runCatching {
+                                    buffer.duplicate().apply {
+                                        position(start)
+                                        limit(start + safeCount)
+                                    }.get(original)
+                                }.getOrElse { return }
+
+                                if (isMicSource(record)) {
+                                    UplinkSender.send(
+                                        original, 0, original.size, hz,
+                                        channels, streamId(record)
+                                    )
+                                }
+
+                                val replacedBytes = ByteArray(safeCount)
+                                val replaced = injectPcm16Bytes(
+                                    replacedBytes, 0, safeCount, hz, channels
+                                )
+
+                                if (replaced) {
+                                    runCatching {
+                                        buffer.duplicate().apply {
+                                            position(start)
+                                            limit(start + safeCount)
+                                        }.put(replacedBytes)
+                                    }.onFailure {
+                                        XposedBridge.log(
+                                            "XMicHook buffer write failed: " + it.message
+                                        )
+                                    }
+                                }
+
+                                finishResult(
+                                    replaced, methodName,
+                                    injectionLogged, muteLogged
+                                ) {
+                                    runCatching {
+                                        val view = buffer.duplicate().apply {
+                                            position(start)
+                                            limit(start + safeCount)
+                                        }
+                                        while (view.hasRemaining()) view.put(0)
+                                    }
+                                }
+                            }
+                        }
                     }
-                } else if (IpcClient.muteRealMic) {
-                    val end = minOf(buf.size, off + count)
-                    if (off >= 0 && end > off) buf.fill(0, off, end)
-                    if (muteLogged.compareAndSet(false, true)) {
-                        Log.i(TAG, "Real mic muted: byte[]")
-                    }
                 }
-            }
+            )
+
+            Log.i(
+                TAG,
+                "Native hook registered: " + methodName +
+                    " overloads=" + hooks.size
+            )
+        }.onFailure {
+            XposedBridge.log(
+                "XMicHook failed native hook " + methodName +
+                    ": " + it.message
+            )
         }
-
-        hookRead(cl, hook, ByteArray::class.java, Int::class.java, Int::class.java)
-        hookRead(
-            cl,
-            hook,
-            ByteArray::class.java,
-            Int::class.java,
-            Int::class.java,
-            Int::class.java
-        )
     }
 
-    private fun hookShortArray(
-        cl: ClassLoader,
+    private fun finishResult(
+        replaced: Boolean,
+        methodName: String,
         injectionLogged: AtomicBoolean,
-        muteLogged: AtomicBoolean
+        muteLogged: AtomicBoolean,
+        muteAction: () -> Unit
     ) {
-        val hook = object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                val count = param.result as? Int ?: return
-                if (count <= 0) return
-
-                val buf = param.args[0] as? ShortArray ?: return
-                val off = param.args[1] as? Int ?: return
-                val record = param.thisObject as? AudioRecord ?: return
-                val hz = sampleRate(record)
-
-                if (isMicSource(record)) {
-                    val end = minOf(buf.size, off + count)
-                    if (off >= 0 && end > off) {
-                        val bytes = AudioResampler.shortsToBytes(buf.copyOfRange(off, end))
-                        UplinkSender.send(
-                            bytes, 0, bytes.size, hz,
-                            channelCount(record), streamId(record)
-                        )
-                    }
-                }
-
-                val replaced = injectShorts(buf, off, count, hz)
-
-                if (replaced) {
-                    if (injectionLogged.compareAndSet(false, true)) {
-                        Log.i(TAG, "Injection active: short[]")
-                    }
-                } else if (IpcClient.muteRealMic) {
-                    val end = minOf(buf.size, off + count)
-                    if (off >= 0 && end > off) buf.fill(0, off, end)
-                    if (muteLogged.compareAndSet(false, true)) {
-                        Log.i(TAG, "Real mic muted: short[]")
-                    }
-                }
+        if (replaced) {
+            if (injectionLogged.compareAndSet(false, true)) {
+                Log.i(
+                    TAG,
+                    "Injection active: native=" + methodName +
+                        " source=16k-mono target=" +
+                        PcmRingBuffer.SAMPLE_RATE_HZ + "k source with channel-aware output"
+                )
+            }
+        } else if (IpcClient.muteRealMic) {
+            muteAction()
+            if (muteLogged.compareAndSet(false, true)) {
+                Log.i(
+                    TAG,
+                    "Real mic muted: native=" + methodName +
+                        " (V6 connected, ring underflow)"
+                )
             }
         }
-
-        hookRead(cl, hook, ShortArray::class.java, Int::class.java, Int::class.java)
-        hookRead(
-            cl,
-            hook,
-            ShortArray::class.java,
-            Int::class.java,
-            Int::class.java,
-            Int::class.java
-        )
     }
 
-    private fun hookByteBuffer(
-        cl: ClassLoader,
-        injectionLogged: AtomicBoolean,
-        muteLogged: AtomicBoolean
-    ) {
-        val hook = object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                val count = param.result as? Int ?: return
-                if (count <= 0) return
-
-                val buffer = param.args[0] as? ByteBuffer ?: return
-                val record = param.thisObject as? AudioRecord ?: return
-                val hz = sampleRate(record)
-
-                val start = (buffer.position() - count).coerceAtLeast(0)
-                val end = minOf(buffer.capacity(), start + count)
-                if (end <= start) return
-
-                val bytes = ByteArray(end - start)
-                buffer.duplicate().apply {
-                    position(start)
-                    limit(end)
-                }.get(bytes)
-
-                if (isMicSource(record)) {
-                    UplinkSender.send(
-                        bytes, 0, bytes.size, hz,
-                        channelCount(record), streamId(record)
-                    )
-                }
-
-                val replaced = injectBytes(bytes, 0, bytes.size, hz)
-
-                if (replaced) {
-                    buffer.duplicate().apply {
-                        position(start)
-                        limit(end)
-                    }.put(bytes)
-
-                    if (injectionLogged.compareAndSet(false, true)) {
-                        Log.i(TAG, "Injection active: ByteBuffer")
-                    }
-                } else if (IpcClient.muteRealMic) {
-                    val view = buffer.duplicate().apply {
-                        position(start)
-                        limit(end)
-                    }
-                    while (view.hasRemaining()) view.put(0)
-
-                    if (muteLogged.compareAndSet(false, true)) {
-                        Log.i(TAG, "Real mic muted: ByteBuffer")
-                    }
-                }
-            }
-        }
-
-        hookRead(cl, hook, ByteBuffer::class.java, Int::class.java)
-        hookRead(
-            cl,
-            hook,
-            ByteBuffer::class.java,
-            Int::class.java,
-            Int::class.java
-        )
-    }
-
-    private fun injectBytes(
+    private fun injectPcm16Bytes(
         dst: ByteArray,
         offset: Int,
-        count: Int,
-        targetHz: Int
+        countBytes: Int,
+        targetHz: Int,
+        channels: Int
     ): Boolean {
-        if (offset < 0 || count <= 0 || offset >= dst.size) return false
-        val safeCount = minOf(count, dst.size - offset)
+        if (offset < 0 || countBytes <= 0 || offset >= dst.size) return false
 
-        if (targetHz == PcmRingBuffer.SAMPLE_RATE_HZ) {
-            return PcmRingBuffer.readBytes(dst, offset, safeCount)
+        val ch = channels.coerceAtLeast(1)
+        val frameBytes = ch * 2
+        val frames = countBytes / frameBytes
+        if (frames <= 0) return false
+
+        val sourceSamples = sourceSamplesForFrames(
+            frames, targetHz, PcmRingBuffer.SAMPLE_RATE_HZ
+        )
+
+        val src = ByteArray(sourceSamples * 2)
+        if (!PcmRingBuffer.readBytes(src, 0, src.size)) return false
+
+        val sourceShorts = AudioResampler.bytesToShorts(
+            src, 0, sourceSamples
+        )
+
+        val monoOut = if (targetHz == PcmRingBuffer.SAMPLE_RATE_HZ) {
+            if (sourceShorts.size < frames) return false
+            sourceShorts.copyOfRange(0, frames)
+        } else {
+            val resampled = AudioResampler.resampleShorts(
+                sourceShorts,
+                0,
+                sourceShorts.size,
+                PcmRingBuffer.SAMPLE_RATE_HZ,
+                targetHz
+            )
+            if (resampled.size < frames) return false
+            resampled.copyOf(frames)
         }
 
-        val srcBytes = AudioResampler.sourceBytesNeeded(
-            safeCount,
-            targetHz,
-            PcmRingBuffer.SAMPLE_RATE_HZ
-        )
-        if (srcBytes <= 0) return false
+        var out = offset
+        for (frame in 0 until frames) {
+            val sample = monoOut[frame].toInt()
+            repeat(ch) {
+                dst[out] = (sample and 0xFF).toByte()
+                dst[out + 1] = ((sample ushr 8) and 0xFF).toByte()
+                out += 2
+            }
+        }
 
-        val tmp = ByteArray(srcBytes)
-        if (!PcmRingBuffer.readBytes(tmp, 0, srcBytes)) return false
-
-        val out = AudioResampler.resampleBytes(
-            tmp, 0, srcBytes,
-            PcmRingBuffer.SAMPLE_RATE_HZ,
-            targetHz
-        )
-
-        val copyCount = minOf(out.size, safeCount)
-        if (copyCount <= 0) return false
-        System.arraycopy(out, 0, dst, offset, copyCount)
+        val written = frames * frameBytes
+        if (written < countBytes) {
+            dst.fill(0, offset + written, offset + countBytes)
+        }
         return true
     }
 
-    private fun injectShorts(
+    private fun injectPcm16Shorts(
         dst: ShortArray,
         offset: Int,
-        count: Int,
-        targetHz: Int
+        countSamples: Int,
+        targetHz: Int,
+        channels: Int
     ): Boolean {
-        if (offset < 0 || count <= 0 || offset >= dst.size) return false
-        val safeCount = minOf(count, dst.size - offset)
+        if (offset < 0 || countSamples <= 0 || offset >= dst.size) return false
 
-        if (targetHz == PcmRingBuffer.SAMPLE_RATE_HZ) {
-            return PcmRingBuffer.readShorts(dst, offset, safeCount)
+        val ch = channels.coerceAtLeast(1)
+        val frames = countSamples / ch
+        if (frames <= 0) return false
+
+        val sourceSamples = sourceSamplesForFrames(
+            frames, targetHz, PcmRingBuffer.SAMPLE_RATE_HZ
+        )
+        val src = ShortArray(sourceSamples)
+
+        if (!PcmRingBuffer.readShorts(src, 0, sourceSamples)) return false
+
+        val monoOut = if (targetHz == PcmRingBuffer.SAMPLE_RATE_HZ) {
+            if (src.size < frames) return false
+            src.copyOfRange(0, frames)
+        } else {
+            val resampled = AudioResampler.resampleShorts(
+                src, 0, src.size,
+                PcmRingBuffer.SAMPLE_RATE_HZ, targetHz
+            )
+            if (resampled.size < frames) return false
+            resampled.copyOf(frames)
         }
 
-        val srcCount = AudioResampler.sourceSamplesNeeded(
-            safeCount,
-            targetHz,
-            PcmRingBuffer.SAMPLE_RATE_HZ
-        )
-        if (srcCount <= 0) return false
-
-        val tmp = ShortArray(srcCount)
-        if (!PcmRingBuffer.readShorts(tmp, 0, srcCount)) return false
-
-        val out = AudioResampler.resampleShorts(
-            tmp, 0, srcCount,
-            PcmRingBuffer.SAMPLE_RATE_HZ,
-            targetHz
-        )
-
-        val copyCount = minOf(out.size, safeCount)
-        if (copyCount <= 0) return false
-        System.arraycopy(out, 0, dst, offset, copyCount)
+        var out = offset
+        for (frame in 0 until frames) {
+            val sample = monoOut[frame]
+            repeat(ch) {
+                dst[out++] = sample
+            }
+        }
         return true
+    }
+
+    private fun injectFloatSamples(
+        dst: FloatArray,
+        offset: Int,
+        countSamples: Int,
+        targetHz: Int,
+        channels: Int
+    ): Boolean {
+        if (offset < 0 || countSamples <= 0 || offset >= dst.size) return false
+
+        val ch = channels.coerceAtLeast(1)
+        val frames = countSamples / ch
+        if (frames <= 0) return false
+
+        val sourceSamples = sourceSamplesForFrames(
+            frames, targetHz, PcmRingBuffer.SAMPLE_RATE_HZ
+        )
+        val src = ShortArray(sourceSamples)
+
+        if (!PcmRingBuffer.readShorts(src, 0, sourceSamples)) return false
+
+        val monoOut = if (targetHz == PcmRingBuffer.SAMPLE_RATE_HZ) {
+            if (src.size < frames) return false
+            src.copyOfRange(0, frames)
+        } else {
+            val resampled = AudioResampler.resampleShorts(
+                src, 0, src.size,
+                PcmRingBuffer.SAMPLE_RATE_HZ, targetHz
+            )
+            if (resampled.size < frames) return false
+            resampled.copyOf(frames)
+        }
+
+        var out = offset
+        for (frame in 0 until frames) {
+            val value = monoOut[frame] / 32768.0f
+            repeat(ch) {
+                dst[out++] = value
+            }
+        }
+        return true
+    }
+
+    private fun sourceSamplesForFrames(
+        targetFrames: Int,
+        targetHz: Int,
+        sourceHz: Int
+    ): Int {
+        if (targetFrames <= 0 || targetHz <= 0 || sourceHz <= 0) return 0
+        return ceil(
+            targetFrames.toDouble() *
+                sourceHz.toDouble() /
+                targetHz.toDouble()
+        ).toInt().coerceAtLeast(1)
     }
 
     private fun sampleRate(record: AudioRecord): Int =
@@ -300,22 +425,5 @@ class XMicHook : IXposedHookLoadPackage {
     private fun isMicSource(record: AudioRecord): Boolean {
         val source = runCatching { record.audioSource }.getOrDefault(-1)
         return source in MIC_SOURCES
-    }
-
-    private fun hookRead(
-        cl: ClassLoader,
-        hook: XC_MethodHook,
-        vararg types: Class<*>
-    ) {
-        runCatching {
-            XposedHelpers.findAndHookMethod(
-                "android.media.AudioRecord",
-                cl,
-                "read",
-                *(types.toList() + hook).toTypedArray()
-            )
-        }.onFailure {
-            XposedBridge.log("XMicHook hook error: " + it.message)
-        }
     }
 }
