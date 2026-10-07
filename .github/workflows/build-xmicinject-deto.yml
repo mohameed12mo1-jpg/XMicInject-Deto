@@ -35,6 +35,7 @@ jobs:
         run: |
           python3 tools/prepare_deto.py upstream
           cp patches/IpcClient.kt upstream/app/src/main/java/com/xmicinject/IpcClient.kt
+          cp patches/PcmRingBuffer.kt upstream/app/src/main/java/com/xmicinject/PcmRingBuffer.kt
           cp patches/XMicHook.kt upstream/app/src/main/java/com/xmicinject/XMicHook.kt
 
       - name: Build APK
