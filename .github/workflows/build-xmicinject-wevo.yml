@@ -1,0 +1,78 @@
+name: Build XMicInject-Wevo
+
+on:
+  push:
+    branches:
+      - wevo-v3-working
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Wevo wrapper
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Clone pinned upstream source
+        run: |
+          git clone https://github.com/n00b-labs/XMicInject.git upstream
+          git -C upstream checkout 7261a91dba76b3b94b0fa71061121257db3ed0a3
+
+      - name: Apply stable v3 audio patches and Wevo identity
+        run: |
+          set -euo pipefail
+          cp patches/IpcClient.kt upstream/app/src/main/java/com/xmicinject/IpcClient.kt
+          cp patches/PcmRingBuffer.kt upstream/app/src/main/java/com/xmicinject/PcmRingBuffer.kt
+          cp patches/XMicHook.kt upstream/app/src/main/java/com/xmicinject/XMicHook.kt
+          python3 tools/prepare_wevo.py upstream
+          grep -F 'applicationId = "ae.wevo.xmicinject"' upstream/app/build.gradle.kts
+          grep -F 'android:label="Wevo"' upstream/app/src/main/AndroidManifest.xml
+          grep -F 'private const val WEVO = "com.all2chat.voip"' upstream/app/src/main/java/com/xmicinject/XMicHook.kt
+
+      - name: Build APK
+        working-directory: upstream
+        run: gradle --no-daemon assembleDebug
+
+      - name: Verify generated package metadata and archive
+        run: |
+          set -euo pipefail
+          APK="upstream/app/build/outputs/apk/debug/app-debug.apk"
+          META="upstream/app/build/outputs/apk/debug/output-metadata.json"
+          test -s "$APK"
+          test -s "$META"
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          apk = Path("upstream/app/build/outputs/apk/debug/app-debug.apk")
+          meta = json.loads(Path("upstream/app/build/outputs/apk/debug/output-metadata.json").read_text())
+          app_id = meta.get("applicationId")
+          if app_id != "ae.wevo.xmicinject":
+              raise SystemExit(f"Unexpected APK applicationId: {app_id!r}")
+          if not apk.is_file() or apk.stat().st_size < 100_000:
+              raise SystemExit("APK missing or unexpectedly small")
+          print(f"Verified applicationId={app_id}, size={apk.stat().st_size}")
+          PY
+          unzip -t "$APK" | tail -n 2
+          sha256sum "$APK"
+          cp "$APK" XMicInject-Wevo-debug.apk
+
+      - name: Upload Wevo debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: XMicInject-Wevo-debug
+          path: XMicInject-Wevo-debug.apk
+          if-no-files-found: error
