@@ -16,7 +16,7 @@ class XMicHook : IXposedHookLoadPackage {
 
     private companion object {
         private const val TAG = "XMicHook"
-        private const val DETO = "ae.deto.app"
+        private const val WEVO = "com.all2chat.voip"
         private val MIC_SOURCES = setOf(
             MediaRecorder.AudioSource.MIC,
             MediaRecorder.AudioSource.VOICE_COMMUNICATION,
@@ -27,12 +27,12 @@ class XMicHook : IXposedHookLoadPackage {
     }
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
-        if (lpparam.packageName != DETO) return
+        if (lpparam.packageName != WEVO) return
 
         val uid = lpparam.appInfo?.uid ?: Process.INVALID_UID
         if (uid in 0 until Process.FIRST_APPLICATION_UID) return
 
-        Log.i(TAG, "Deto native hook loaded: " + DETO)
+        Log.i(TAG, "Wevo native hook loaded: " + WEVO)
         IpcClient.startOnce()
 
         val injectionLogged = AtomicBoolean(false)
